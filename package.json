@@ -1,0 +1,86 @@
+{
+  "name": "pdf-viewer",
+  "version": "1.0.0",
+  "description": "PDF Viewer",
+  "main": "main.js",
+  "author": "Thiago",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis portable",
+    "release": "electron-builder --win nsis --publish never"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "pdfjs-dist": "3.11.174"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.thiago.pdfviewer",
+    "productName": "PDF Viewer",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "renderer/**",
+      "node_modules/**/*",
+      "package.json",
+      "!node_modules/pdfjs-dist/{legacy,types,web,image_decoders}/**",
+      "!node_modules/pdfjs-dist/build/*.map",
+      "!node_modules/pdfjs-dist/build/*.mjs",
+      "!node_modules/pdfjs-dist/build/pdf.js",
+      "!node_modules/pdfjs-dist/build/pdf.worker.js"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false,
+      "fileAssociations": [
+        {
+          "ext": "pdf",
+          "name": "PDF Document",
+          "role": "Viewer"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "artifactName": "PDF-Viewer-Setup-${version}.exe"
+    },
+    "portable": {
+      "artifactName": "PDF-Viewer-Portable-${version}.exe"
+    },
+    "electronLanguages": [
+      "en-US"
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "ianarosa",
+        "repo": "pdf-viewer"
+      }
+    ]
+  }
+}
