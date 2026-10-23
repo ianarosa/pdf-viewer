@@ -94,7 +94,7 @@ function setupAutoUpdate() {
     autoUpdater.on('checking-for-update', () => { if (manualCheck) sendUpdate({ state: 'checking' }); });
     autoUpdater.on('update-not-available', () => { if (manualCheck) sendUpdate({ state: 'not-available', version: app.getVersion() }); manualCheck = false; });
     autoUpdater.on('error', () => { /* launch-time check stays silent; manual checks report */ if (manualCheck) sendUpdate({ state: 'error' }); manualCheck = false; });
-    ipcMain.on('install-update', () => { try { autoUpdater.quitAndInstall(); } catch {} });
+    ipcMain.on('install-update', () => { try { autoUpdater.quitAndInstall(true, true); } catch {} });
     const p = autoUpdater.checkForUpdates();
     if (p && p.catch) p.catch(() => {});
   } catch { /* never block startup */ }
