@@ -5,7 +5,7 @@
   const els = {
     fileName: $('fileName'), counter: $('counter'), counterText: $('counterText'), jump: $('jumpInput'),
     search: $('search'), results: $('results'),
-    viewer: $('viewer'), pages: $('pages'), empty: $('empty'), error: $('error'), status: $('status'),
+    viewer: null, pages: null, stage: $('stage'), empty: $('empty'), error: $('error'), status: $('status'),
     errorTitle: $('errorTitle'), errorFile: $('errorFile'), errorMsg: $('errorMsg'),
     prev: $('prev'), next: $('next'), pageInd: $('pageInd'), veil: $('dropVeil'),
     zoomVal: $('zoomVal'),
@@ -36,8 +36,17 @@
   const cmp = (a, b) => collator.compare(a.name, b.name) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
   let files = [];            // [{path,name}] sorted
   let current = -1;          // index into files
+  let sources = [];          // ROOT paths (folders / files) that were opened; this is what the session stores
+  const MAX_SOURCES = 300;
 
-  function addItems(items) {
+  function noteSources(roots) {
+    for (const r of roots || []) {
+      if (typeof r === 'string' && r && !sources.includes(r) && sources.length < MAX_SOURCES) sources.push(r);
+    }
+    saveSessionSoon();
+  }
+
+  function addItems(items, restoreScroll) {
     if (!items || !items.length) return;
     const curPath = current >= 0 ? files[current].path : null;
     const seen = new Set(files.map((f) => f.path));
@@ -54,6 +63,7 @@
       current = files.findIndex((f) => f.path === curPath);
       updateChrome();
       refreshPreload();
+      saveSessionSoon();
       if (els.search.value) runSearch();
     } else {
       go(0);
@@ -63,17 +73,102 @@
 
   async function withPaths(paths) {
     if (!api || !paths || !paths.length) return;
-    try { addItems(await api.resolvePaths(paths)); } catch (e) { flash('Could not read those items'); }
+    try {
+      const items = await api.resolvePaths(paths);
+      if (items && items.length) noteSources(paths);
+      addItems(items);
+    } catch (e) { flash('Could not read those items'); }
   }
-  async function doOpenFolder() { try { addItems(await api.openFolder()); } catch (e) { flash('Could not open folder'); } }
-  async function doOpenFiles() { try { addItems(await api.openFiles()); } catch (e) { flash('Could not open files'); } }
+  async function pickVia(fn) {
+    const items = await fn();
+    if (items && items.length) {
+      let roots = [];
+      try { if (api.lastRoots) roots = await api.lastRoots(); } catch (_) {}
+      if (!roots || !roots.length) roots = items.length <= 200 ? items.map((i) => i.path) : [];
+      noteSources(roots);
+    }
+    addItems(items);
+  }
+  async function doOpenFolder() { try { await pickVia(() => api.openFolder()); } catch (e) { flash('Could not open folder'); } }
+  async function doOpenFiles() { try { await pickVia(() => api.openFiles()); } catch (e) { flash('Could not open files'); } }
+
+  /* ---------------- session persistence ---------------- */
+  const SESSION_KEY = 'pdfviewer.session';
+  let curScroll = { page: 1, frac: 0 };   // scroll position inside the current file
+  let pendingRestore = null;               // scroll target to apply when the current file opens
+  let launchOverride = false;              // OS launch args seen: they win over the restored session
+  let sessionTimer = 0;
+
+  function saveSession() {
+    clearTimeout(sessionTimer); sessionTimer = 0;
+    try {
+      if (!files.length || current < 0) { localStorage.removeItem(SESSION_KEY); return; }
+      if (V && !V.staging && !V.dead) {
+        curScroll = V.restoreTarget ? V.restoreTarget : scrollPos(V);
+      }
+      localStorage.setItem(SESSION_KEY, JSON.stringify({
+        v: 1, sources, path: files[current].path, idx: current, page: curScroll.page, frac: curScroll.frac,
+      }));
+    } catch (_) {}
+  }
+  function saveSessionSoon() {
+    clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(saveSession, 400);
+  }
+  window.addEventListener('beforeunload', saveSession);
+  window.addEventListener('pagehide', saveSession);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveSession(); });
+
+  async function restoreSession() {
+    try {
+      if (!api) return;
+      const s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null');
+      if (!s || !Array.isArray(s.sources) || !s.sources.length) return;
+      const roots = s.sources.filter((x) => typeof x === 'string' && x).slice(0, MAX_SOURCES);
+      const items = await api.resolvePaths(roots);
+      if (launchOverride || files.length || !items || !items.length) return;   // user/OS already opened something
+      sources = roots;
+      const list = [];
+      const seen = new Set();
+      for (const it of items) {
+        if (!it || !it.path || seen.has(it.path)) continue;
+        seen.add(it.path);
+        list.push({ path: it.path, name: it.name || String(it.path).split(/[\\/]/).pop() });
+      }
+      list.sort(cmp);
+      if (!list.length) return;
+      files = list;
+      let idx = files.findIndex((f) => f.path === s.path);
+      let rs = null;
+      if (idx >= 0) {
+        const page = Math.max(1, s.page | 0), frac = Math.min(1, Math.max(0, +s.frac || 0));
+        if (page > 1 || frac > 0) rs = { page, frac };
+      } else {
+        idx = Math.min(files.length - 1, Math.max(0, s.idx | 0));   // file is gone: nearest index
+      }
+      go(idx, rs);
+    } catch (_) { /* fall back to the empty state silently */ }
+  }
+
+  function closeAll() {
+    navToken++;
+    files = []; current = -1; sources = [];
+    curScroll = { page: 1, frac: 0 }; pendingRestore = null;
+    discardView(V); V = null;
+    discardView(frozen); frozen = null;
+    pruneCache(new Set());
+    els.error.hidden = true; els.pageInd.hidden = true; setStatus('');
+    els.search.value = ''; closeResults();
+    updateChrome();
+    saveSession();
+  }
 
   /* ---------------- doc cache (current +/- 1 only) ---------------- */
-  const cache = new Map();   // path -> {promise}
+  const cache = new Map();   // path -> {promise, doc, dead, first:{canvas,scale,dpr}|null}
   function getEntry(path) {
     let e = cache.get(path);
     if (e) return e;
-    e = { promise: null, doc: null, dead: false };
+    e = { promise: null, doc: null, dead: false, first: null, firstBusy: false, firstSlot: null };
     e.promise = (async () => {
       const data = await api.readFile(path);
       const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -92,11 +187,16 @@
     cache.set(path, e);
     return e;
   }
+  function freeFirst(e) {
+    if (e.firstSlot && e.firstSlot.task) { try { e.firstSlot.task.cancel(); } catch (_) {} }
+    if (e.first) { e.first.canvas.width = 0; e.first.canvas.height = 0; e.first = null; }
+  }
   function pruneCache(keep) {
     for (const [p, e] of cache) {
       if (keep.has(p)) continue;
       e.dead = true;
       cache.delete(p);
+      freeFirst(e);
       if (e.doc) { try { e.doc.destroy(); } catch (_) {} }
     }
   }
@@ -107,16 +207,47 @@
     pruneCache(keep);
   }
   function preloadNeighbours() {
-    for (const i of [current + 1, current - 1]) if (files[i]) getEntry(files[i].path);
+    for (const i of [current + 1, current - 1]) {
+      if (!files[i]) continue;
+      const e = getEntry(files[i].path);
+      prerenderFirst(e);
+    }
+  }
+  // Render page 1 of a preloaded neighbour at the current zoom so an arrow flip can swap instantly.
+  async function prerenderFirst(e) {
+    if (e.first || e.firstBusy || e.dead) return;
+    e.firstBusy = true;
+    let page = null, canvas = null;
+    try {
+      const doc = await e.promise;
+      if (e.dead) return;
+      page = await doc.getPage(1);
+      if (e.dead) return;
+      const [w, h] = pageSize(page);
+      const scale = computeScaleFor(w, h);
+      e.firstSlot = {};
+      canvas = await paint(page, scale, e.firstSlot);
+      if (e.dead) { canvas.width = 0; canvas = null; return; }
+      e.first = { canvas, scale, dpr: window.devicePixelRatio || 1 };
+      canvas = null;
+    } catch (_) { /* ignore: normal render path will handle it */ }
+    finally {
+      if (canvas) canvas.width = 0;
+      if (page) { try { page.cleanup(); } catch (_) {} }
+      e.firstBusy = false; e.firstSlot = null;
+    }
   }
 
   /* ---------------- navigation ---------------- */
   let navToken = 0;
-  function go(i) {
+  function go(i, restoreScroll) {
     if (i < 0 || i >= files.length) return;
     current = i;
+    curScroll = restoreScroll || { page: 1, frac: 0 };
+    pendingRestore = restoreScroll || null;
     updateChrome();
     refreshPreload();
+    saveSessionSoon();
     openCurrent();
   }
   const prevFile = () => { if (current > 0) go(current - 1); };
@@ -127,6 +258,7 @@
     const has = current >= 0 && n > 0;
     els.empty.hidden = n > 0;
     els.counter.hidden = !has;
+    $('btnClose').hidden = !has;
     if (!els.jump.hidden && !has) els.jump.hidden = true;
     els.prev.hidden = els.next.hidden = !has;
     els.prev.disabled = !has || current <= 0;
@@ -144,8 +276,11 @@
     }
   }
 
-  /* ---------------- viewer ---------------- */
-  let V = null;   // current doc view
+  /* ---------------- viewer (double-buffered) ----------------
+     V       = the view being built (staging, hidden) or the live one.
+     frozen  = the previous file's view: stays on screen, inert, until V's first page is painted. */
+  let V = null;
+  let frozen = null;
   const MAX_CANVAS_PIXELS = 24e6;
 
   function setStatus(msg) {
@@ -155,14 +290,26 @@
   let flashTimer = 0;
   function flash(msg) { setStatus(msg); clearTimeout(flashTimer); flashTimer = setTimeout(() => setStatus(''), 3000); }
 
-  function teardownViewer() {
+  function stopView(v) {
+    v.dead = true;
+    v.near.clear();
+    if (v.io1) v.io1.disconnect();
+    if (v.io2) v.io2.disconnect();
+    clearTimeout(v.swapTimer);
+    for (const p of v.pages) cancelPage(p);
+  }
+  function discardView(v) {
+    if (!v) return;
+    stopView(v);
+    for (const p of v.pages) if (p.canvas) { p.canvas.width = 0; p.canvas.height = 0; p.canvas = null; }
+    v.scroller.remove();
+    if (v === V) els.pageInd.hidden = true;
+  }
+  // Called at the start of every navigation: keep what is on screen, stop it working.
+  function retireView() {
     if (!V) return;
-    V.dead = true;
-    V.near.clear();
-    if (V.io1) V.io1.disconnect();
-    if (V.io2) V.io2.disconnect();
-    for (const p of V.pages) cancelPage(p);
-    els.pages.textContent = '';   // drops canvases
+    if (V.staging) discardView(V);
+    else { if (frozen) discardView(frozen); frozen = V; stopView(V); }
     V = null;
     els.pageInd.hidden = true;
   }
@@ -178,7 +325,8 @@
   }
 
   function showError(f, err) {
-    teardownViewer();
+    discardView(V); V = null;
+    discardView(frozen); frozen = null;
     let title = 'Can’t open this PDF', msg = '';
     const name = err && err.name;
     if (name === 'PasswordException') { title = 'Password-protected PDF'; msg = 'This file is encrypted and can’t be shown.'; }
@@ -195,19 +343,17 @@
   async function openCurrent() {
     const token = ++navToken;
     const f = files[current];
-    teardownViewer();
+    const restore = pendingRestore; pendingRestore = null;
+    retireView();
     els.error.hidden = true;
     const slow = setTimeout(() => { if (token === navToken) setStatus('Loading…'); }, 160);
     try {
-      const doc = await getEntry(f.path).promise;
+      const entry = getEntry(f.path);
+      const doc = await entry.promise;
       if (token !== navToken) return;
       const first = await doc.getPage(1);
-      if (token !== navToken) return;
-      buildViewer(doc, first, token);
-      setStatus('');
-      els.viewer.scrollTop = 0; els.viewer.scrollLeft = 0;
-      if (!isTyping(document.activeElement)) els.viewer.focus({ preventScroll: true });
-      preloadNeighbours();
+      if (token !== navToken) { first.cleanup(); return; }
+      buildViewer(doc, first, token, entry, f.path, restore);
     } catch (err) {
       if (token !== navToken) return;
       cache.delete(f.path);
@@ -223,45 +369,132 @@
     return [v.width, v.height];
   }
 
-  function buildViewer(doc, first, token) {
+  function makeScroller() {
+    const sc = document.createElement('div');
+    sc.className = 'viewer staging';
+    sc.tabIndex = 0;
+    sc.setAttribute('aria-label', 'PDF pages');
+    const pg = document.createElement('div');
+    pg.className = 'pages';
+    sc.appendChild(pg);
+    sc.addEventListener('wheel', (e) => {
+      if (V) V.restoreTarget = null;
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      stepZoom(e.deltaY < 0 ? 1.1 : 1 / 1.1);
+    }, { passive: false });
+    sc.addEventListener('scroll', () => {
+      if (!V || V.scroller !== sc) return;
+      onScroll(); pump(); saveSessionSoon();
+      clearTimeout(sweepTimer); sweepTimer = setTimeout(sweep, 250);
+    }, { passive: true });
+    sc.addEventListener('mousedown', () => { if (V) V.restoreTarget = null; if (document.activeElement !== sc) sc.focus({ preventScroll: true }); });
+    sc.addEventListener('touchstart', () => { if (V) V.restoreTarget = null; }, { passive: true });
+    els.stage.insertBefore(sc, els.stage.firstChild);
+    return { sc, pg };
+  }
+
+  function buildViewer(doc, first, token, entry, path, restore) {
     const n = doc.numPages;
     const [w1, h1] = pageSize(first);
     first.cleanup();
-    V = { doc, token, n, pages: [], near: new Set(), scale: 1, gen: 0, dead: false, queue: [], active: 0, w1, h1, io1: null, io2: null };
+    const { sc, pg } = makeScroller();
+    V = {
+      doc, token, n, path, entry, scroller: sc, pagesEl: pg, staging: true, pages: [], near: new Set(), scale: 1, gen: 0,
+      dead: false, queue: [], active: 0, w1, h1, io1: null, io2: null, restoreTarget: restore, swapTimer: 0,
+    };
+    const view = V;
     const frag = document.createDocumentFragment();
     for (let i = 0; i < n; i++) {
       const el = document.createElement('div');
       el.className = 'page';
       el.dataset.n = String(i + 1);
       const p = { n: i + 1, el, w: w1, h: h1, sized: i === 0, canvas: null, task: null, rendering: false, rscale: 0, token: 0 };
-      V.pages.push(p);
+      view.pages.push(p);
       frag.appendChild(el);
     }
-    els.pages.appendChild(frag);
-    V.scale = computeScale();
+    pg.appendChild(frag);
+    view.scale = computeScale();
     applySizes();
-    updateZoomLabel();
+    if (restore) applyRestore(view); else sc.scrollTop = 0;
 
-    V.io1 = new IntersectionObserver((entries) => {
-      if (!V || V.dead) return;
+    // Page 1 pre-rendered while this file was a neighbour: adopt it, no render needed.
+    const fc = entry && entry.first;
+    const p1 = view.pages[0];
+    if (fc && fc.dpr === (window.devicePixelRatio || 1) && Math.abs(fc.scale - view.scale) / view.scale < 0.015) {
+      entry.first = null;
+      p1.canvas = fc.canvas; p1.rscale = view.scale;
+      p1.el.appendChild(fc.canvas);
+    } else if (fc) freeFirst(entry);
+
+    view.io1 = new IntersectionObserver((entries) => {
+      if (view.dead) return;
       for (const en of entries) {
         const n1 = +en.target.dataset.n;
-        if (en.isIntersecting) { V.near.add(n1); queueRender(n1); }
-        else V.near.delete(n1);
+        if (en.isIntersecting) { view.near.add(n1); queueRender(view, n1); }
+        else view.near.delete(n1);
       }
       pump();
-    }, { root: els.viewer, rootMargin: '120% 0px 120% 0px' });
-    V.io2 = new IntersectionObserver((entries) => {
-      if (!V || V.dead) return;
+    }, { root: sc, rootMargin: '120% 0px 120% 0px' });
+    view.io2 = new IntersectionObserver((entries) => {
+      if (view.dead) return;
       for (const en of entries) {
         if (en.isIntersecting) continue;
-        const p = V.pages[+en.target.dataset.n - 1];
+        const p = view.pages[+en.target.dataset.n - 1];
         if (p.canvas || p.rendering) freeCanvas(p);
       }
-    }, { root: els.viewer, rootMargin: '350% 0px 350% 0px' });
-    for (const p of V.pages) { V.io1.observe(p.el); V.io2.observe(p.el); }
+    }, { root: sc, rootMargin: '350% 0px 350% 0px' });
+    for (const p of view.pages) { view.io1.observe(p.el); view.io2.observe(p.el); }
+    view.swapTimer = setTimeout(() => swapIn(view), 4000);   // never stay hidden forever
+    if (p1.canvas && (!restore || restore.page === 1)) swapIn(view);
+    if (n > 1) measureRest(view);
+  }
+
+  // Reveal the staged view once something is painted; drop the frozen one. Page-1 bitmap of the
+  // old file is handed back to its cache entry (if still a neighbour) so flipping back is instant.
+  function swapIn(view) {
+    if (view !== V || view.dead || !view.staging) return;
+    clearTimeout(view.swapTimer);
+    view.staging = false;
+    view.scroller.classList.remove('staging');
+    const old = frozen; frozen = null;
+    if (old) {
+      const e = old.entry, p1 = old.pages[0];
+      if (e && cache.get(old.path) === e && !e.dead && !e.first && p1 && p1.canvas && p1.rscale === old.scale) {
+        p1.canvas.remove();
+        e.first = { canvas: p1.canvas, scale: old.scale, dpr: window.devicePixelRatio || 1 };
+        p1.canvas = null;
+      }
+      discardView(old);
+    }
+    for (const el of document.querySelectorAll('#viewer, #pages')) el.removeAttribute('id');
+    view.scroller.id = 'viewer'; view.pagesEl.id = 'pages';
+    view.scroller.dataset.path = view.path;
+    els.viewer = view.scroller; els.pages = view.pagesEl;
+    updateZoomLabel();
+    setStatus('');
     onScroll();
-    if (n > 1) measureRest(V);
+    if (!isTyping(document.activeElement)) view.scroller.focus({ preventScroll: true });
+    preloadNeighbours();
+  }
+
+  function scrollPos(v) {
+    const st = v.scroller.scrollTop;
+    if (st <= 0) return { page: 1, frac: 0 };
+    let lo = 0, hi = v.pages.length - 1;
+    while (lo < hi) {
+      const m = (lo + hi + 1) >> 1;
+      if (v.pages[m].el.offsetTop <= st) lo = m; else hi = m - 1;
+    }
+    const el = v.pages[lo].el;
+    const frac = el.offsetHeight > 0 ? Math.min(1, Math.max(0, (st - el.offsetTop) / el.offsetHeight)) : 0;
+    return { page: lo + 1, frac };
+  }
+  function applyRestore(view) {
+    const t = view.restoreTarget;
+    if (!t) return;
+    const p = view.pages[Math.min(view.n, Math.max(1, t.page)) - 1];
+    view.scroller.scrollTop = (t.page === 1 && t.frac === 0) ? 0 : p.el.offsetTop + t.frac * p.el.offsetHeight;
   }
 
   // Learn real page sizes in the background (cheap; no rendering).
@@ -276,10 +509,14 @@
         page.cleanup();
         const p = view.pages[i - 1];
         p.sized = true;
-        if (Math.abs(w - p.w) > 0.5 || Math.abs(h - p.h) > 0.5) { p.w = w; p.h = h; changed = true; sizePage(view, p); if (view.near.has(i)) { freeCanvas(p); queueRender(i); } }
+        if (Math.abs(w - p.w) > 0.5 || Math.abs(h - p.h) > 0.5) {
+          p.w = w; p.h = h; changed = true; sizePage(view, p);
+          if (view.near.has(i)) { p.rscale = 0; queueRender(view, i); }   // keep old canvas until the new one is drawn
+        }
       } catch (_) { return; }
-      if (i % 25 === 0) { if (changed) pump(); await new Promise((r) => setTimeout(r, 0)); }
+      if (i % 25 === 0) { if (changed) { applyRestore(view); pump(); } await new Promise((r) => setTimeout(r, 0)); }
     }
+    if (changed) applyRestore(view);
     pump();
   }
 
@@ -290,15 +527,15 @@
   function applySizes() { for (const p of V.pages) sizePage(V, p); }
 
   /* ---------------- rendering queue ---------------- */
-  function queueRender(n) {
-    const p = V.pages[n - 1];
+  function queueRender(view, n) {
+    const p = view.pages[n - 1];
     if (p.rendering) return;
-    if (p.canvas && p.rscale === V.scale) return;
-    if (!V.queue.includes(n)) V.queue.push(n);
+    if (p.canvas && p.rscale === view.scale) return;
+    if (!view.queue.includes(n)) view.queue.push(n);
   }
   function currentPageNo() {
     if (!V) return 1;
-    const mid = els.viewer.scrollTop + els.viewer.clientHeight / 3;
+    const mid = V.scroller.scrollTop + V.scroller.clientHeight / 3;
     let lo = 0, hi = V.pages.length - 1;
     while (lo < hi) {
       const m = (lo + hi + 1) >> 1;
@@ -320,6 +557,23 @@
       renderPage(V, V.pages[n - 1]);
     }
   }
+  // Draw one page into a fresh canvas. slot.task receives the render task (for cancel).
+  async function paint(page, scale, slot) {
+    const vp = page.getViewport({ scale });
+    let dpr = window.devicePixelRatio || 1;
+    const px = vp.width * vp.height * dpr * dpr;
+    if (px > MAX_CANVAS_PIXELS) dpr *= Math.sqrt(MAX_CANVAS_PIXELS / px);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(vp.width * dpr));
+    canvas.height = Math.max(1, Math.floor(vp.height * dpr));
+    try {
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      slot.task = page.render({ canvasContext: ctx, viewport: vp, transform: [dpr, 0, 0, dpr, 0, 0], background: '#ffffff' });
+      await slot.task.promise;
+    } catch (err) { canvas.width = 0; throw err; }
+    return canvas;
+  }
   async function renderPage(view, p) {
     if (p.rendering) return;
     p.rendering = true; view.active++;
@@ -328,24 +582,17 @@
     try {
       page = await view.doc.getPage(p.n);
       if (view.dead || myTok !== p.token) return;
-      const vp = page.getViewport({ scale });
-      let dpr = window.devicePixelRatio || 1;
-      const px = vp.width * vp.height * dpr * dpr;
-      if (px > MAX_CANVAS_PIXELS) dpr *= Math.sqrt(MAX_CANVAS_PIXELS / px);
-      canvas = document.createElement('canvas');
-      canvas.width = Math.max(1, Math.floor(vp.width * dpr));
-      canvas.height = Math.max(1, Math.floor(vp.height * dpr));
-      const ctx = canvas.getContext('2d', { alpha: false });
-      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-      p.task = page.render({ canvasContext: ctx, viewport: vp, transform: [dpr, 0, 0, dpr, 0, 0], background: '#ffffff' });
-      await p.task.promise;
-      if (view.dead || myTok !== p.token || gen !== view.gen) { canvas.width = 0; return; }
+      canvas = await paint(page, scale, p);
+      if (view.dead || myTok !== p.token || gen !== view.gen) { canvas.width = 0; canvas = null; return; }
+      // swap old canvas for the new one in the same task: no frame without content
       if (p.canvas) { p.canvas.width = 0; p.canvas.remove(); }
       p.canvas = canvas; canvas = null; p.rscale = scale;
       p.el.appendChild(p.canvas);
+      if (view.staging) swapIn(view);
     } catch (err) {
       if (!(err && err.name === 'RenderingCancelledException')) {
         if (!view.dead && myTok === p.token) console.warn('page render failed', p.n, err && err.message);
+        if (!view.dead && view.staging) swapIn(view);   // don't hang on a page that cannot render
       }
     } finally {
       if (canvas) canvas.width = 0;
@@ -353,7 +600,7 @@
       if (myTok === p.token) { p.task = null; p.rendering = false; }
       view.active--;
       if (!view.dead) {
-        if (view.near.has(p.n) && p.rscale !== view.scale) queueRender(p.n);
+        if (view.near.has(p.n) && p.rscale !== view.scale) queueRender(view, p.n);
         pump();
       }
     }
@@ -361,16 +608,22 @@
 
   /* ---------------- zoom ---------------- */
   const MIN_Z = 0.1, MAX_Z = 6;
-  function computeScale() {
-    if (!V) return 1;
-    const cs = getComputedStyle(els.pages);
-    const availW = els.viewer.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
-    const availH = els.viewer.clientHeight - 44;
+  function computeScaleFor(w1, h1) {
+    const host = V ? V.scroller : els.stage;
+    const pe = V ? V.pagesEl : null;
+    let pl = 22, pr = 22;
+    if (pe) { const cs = getComputedStyle(pe); pl = parseFloat(cs.paddingLeft) || 0; pr = parseFloat(cs.paddingRight) || 0; }
+    const availW = host.clientWidth - pl - pr;
+    const availH = host.clientHeight - 44;
     let s;
-    if (settings.zoom === 'page') s = Math.min(availW / V.w1, availH / V.h1);
-    else if (settings.zoom === 'width') s = availW / V.w1;
+    if (settings.zoom === 'page') s = Math.min(availW / w1, availH / h1);
+    else if (settings.zoom === 'width') s = availW / w1;
     else s = +settings.zoom || 1;
     return Math.min(MAX_Z, Math.max(MIN_Z, s || 1));
+  }
+  function computeScale() {
+    if (!V) return 1;
+    return computeScaleFor(V.w1, V.h1);
   }
   function updateZoomLabel() {
     const s = V ? V.scale : 1;
@@ -384,7 +637,7 @@
   }
   function relayout() {
     if (!V) return;
-    const v = els.viewer;
+    const v = V.scroller;
     const ratio = v.scrollHeight > 0 ? v.scrollTop / v.scrollHeight : 0;
     const ratioX = v.scrollWidth > 0 ? (v.scrollLeft + v.clientWidth / 2) / v.scrollWidth : 0.5;
     V.scale = computeScale();
@@ -392,6 +645,8 @@
     updateZoomLabel();
     v.scrollTop = ratio * v.scrollHeight;
     v.scrollLeft = Math.max(0, ratioX * v.scrollWidth - v.clientWidth / 2);
+    // stale neighbour bitmaps no longer match: drop them, they re-render lazily
+    for (const e of cache.values()) freeFirst(e);
     clearTimeout(zoomTimer);
     const view = V;
     zoomTimer = setTimeout(() => {
@@ -399,10 +654,12 @@
       view.gen++;
       view.queue.length = 0;
       for (const p of view.pages) {
-        if (view.near.has(p.n)) { if (p.rendering) cancelPage(p); queueRender(p.n); }
+        // keep the old canvas (CSS-stretched) until the re-render replaces it: no blank frame
+        if (view.near.has(p.n)) { if (p.rendering) cancelPage(p); queueRender(view, p.n); }
         else freeCanvas(p);
       }
       pump();
+      if (!view.staging) preloadNeighbours();
     }, 140);
   }
   function stepZoom(f) { setZoom(+(V ? V.scale : 1) * f); }
@@ -410,19 +667,13 @@
     if (V && (settings.zoom === 'width' || settings.zoom === 'page')) relayout();
   });
 
-  els.viewer.addEventListener('wheel', (e) => {
-    if (!e.ctrlKey) return;
-    e.preventDefault();
-    stepZoom(e.deltaY < 0 ? 1.1 : 1 / 1.1);
-  }, { passive: false });
-
   /* page indicator */
   let rafScroll = 0, indTimer = 0;
   function onScroll() {
     if (rafScroll) return;
     rafScroll = requestAnimationFrame(() => {
       rafScroll = 0;
-      if (!V || V.n < 2) { els.pageInd.hidden = true; return; }
+      if (!V || V.staging || V.n < 2) { els.pageInd.hidden = true; return; }
       els.pageInd.textContent = 'Page ' + currentPageNo() + ' / ' + V.n;
       els.pageInd.hidden = false;
       clearTimeout(indTimer);
@@ -433,15 +684,13 @@
   let sweepTimer = 0;
   function sweep() {
     if (!V || V.dead) return;
-    const v = els.viewer, H = v.clientHeight, top = v.scrollTop - 3.5 * H, bot = v.scrollTop + 4.5 * H;
+    const v = V.scroller, H = v.clientHeight, top = v.scrollTop - 3.5 * H, bot = v.scrollTop + 4.5 * H;
     for (const p of V.pages) {
       if (!p.canvas && !p.rendering) continue;
       const t = p.el.offsetTop, b = t + p.el.offsetHeight;
       if (b < top || t > bot) freeCanvas(p);
     }
   }
-  els.viewer.addEventListener('scroll', () => { onScroll(); pump(); clearTimeout(sweepTimer); sweepTimer = setTimeout(sweep, 250); }, { passive: true });
-  els.viewer.addEventListener('mousedown', () => { if (document.activeElement !== els.viewer) els.viewer.focus({ preventScroll: true }); });
 
   /* ---------------- search ---------------- */
   const MAX_RESULTS = 200;
@@ -514,7 +763,7 @@
     closeResults();
     els.search.blur();
     go(idx);
-    els.viewer.focus({ preventScroll: true });
+    focusViewer();
   }
   els.search.addEventListener('input', runSearch);
   els.search.addEventListener('focus', () => { if (els.search.value) runSearch(); });
@@ -523,7 +772,7 @@
     if (e.key === 'ArrowDown') { e.preventDefault(); if (shown) { activeRes = (activeRes + 1) % shown; syncActive(); } }
     else if (e.key === 'ArrowUp') { e.preventDefault(); if (shown) { activeRes = (activeRes - 1 + shown) % shown; syncActive(); } }
     else if (e.key === 'Enter') { e.preventDefault(); chooseResult(activeRes); }
-    else if (e.key === 'Escape') { e.preventDefault(); els.search.value = ''; closeResults(); els.search.blur(); els.viewer.focus({ preventScroll: true }); }
+    else if (e.key === 'Escape') { e.preventDefault(); els.search.value = ''; closeResults(); els.search.blur(); focusViewer(); }
   });
   els.results.addEventListener('mousedown', (e) => {
     e.preventDefault();
@@ -558,8 +807,8 @@
       const v = parseInt(els.jump.value, 10);
       closeJump();
       if (Number.isFinite(v) && files.length) go(Math.min(files.length, Math.max(1, v)) - 1);
-      els.viewer.focus({ preventScroll: true });
-    } else if (e.key === 'Escape') { e.preventDefault(); closeJump(); els.viewer.focus({ preventScroll: true }); }
+      focusViewer();
+    } else if (e.key === 'Escape') { e.preventDefault(); closeJump(); focusViewer(); }
   });
   els.jump.addEventListener('input', () => { els.jump.value = els.jump.value.replace(/[^\d]/g, ''); });
   els.jump.addEventListener('blur', closeJump);
@@ -576,6 +825,7 @@
   $('fitWidth').addEventListener('click', () => setZoom('width'));
   $('fitPage').addEventListener('click', () => setZoom('page'));
 
+  function focusViewer() { if (V && V.scroller) V.scroller.focus({ preventScroll: true }); else if (els.viewer) els.viewer.focus({ preventScroll: true }); }
   function isTyping(el) {
     return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
   }
@@ -612,21 +862,56 @@
     withPaths(paths);
   });
 
-  if (api && api.onOpenPaths) api.onOpenPaths((paths) => withPaths(paths));
+  if (api && api.onOpenPaths) api.onOpenPaths((paths, meta) => {
+    if (meta && meta.launch) {            // OS launch / Open-with args win over the restored session
+      launchOverride = true;
+      if (files.length) closeAll();
+    }
+    withPaths(paths);
+  });
+  $('btnClose').addEventListener('click', closeAll);
 
-  // Auto-update toast (only shown once an update is fully downloaded)
+  // Update toast: manual "Check for updates" + background download status
   const updateToast = document.getElementById('updateToast');
-  const onUpdateStatus = (s) => {
-    if (!s || s.state !== 'downloaded' || !updateToast) return;
+  const updateMsg = document.getElementById('updateMsg');
+  const updateRestart = document.getElementById('updateRestart');
+  let toastTimer = 0;
+  function toast(msg, opts) {
+    if (!updateToast) return;
+    opts = opts || {};
+    updateMsg.textContent = msg;
+    updateRestart.hidden = !opts.restart;
     updateToast.hidden = false;
+    clearTimeout(toastTimer);
+    if (opts.ms) toastTimer = setTimeout(() => { updateToast.hidden = true; }, opts.ms);
+  }
+  let manualUpdate = false;   // only react to checking/not-available/error after a click
+  const onUpdateStatus = (s) => {
+    if (!s) return;
+    if (s.state === 'downloaded') { manualUpdate = false; toast('Update ready - Restart to install', { restart: true }); }
+    else if (s.state === 'available') { if (manualUpdate) toast('Update found - downloading...'); }
+    else if (s.state === 'checking') { if (manualUpdate) toast('Checking...'); }
+    else if (s.state === 'not-available') { if (manualUpdate) toast("You're up to date" + (s.version ? ' (v' + s.version + ')' : ''), { ms: 4000 }); manualUpdate = false; }
+    else if (s.state === 'error') { if (manualUpdate) toast("Couldn't check for updates", { ms: 5000 }); manualUpdate = false; }
   };
   if (api && api.onUpdateStatus) api.onUpdateStatus(onUpdateStatus);
   window.addEventListener('pdfv-update-status', (e) => onUpdateStatus(e.detail));
-  document.getElementById('updateRestart')?.addEventListener('click', () => api.installUpdate());
+  updateRestart?.addEventListener('click', () => api.installUpdate());
   document.getElementById('updateDismiss')?.addEventListener('click', () => { updateToast.hidden = true; });
+  $('btnUpdate').addEventListener('click', async () => {
+    if (!api || !api.checkForUpdates) { toast('Updates unavailable in portable/dev build', { ms: 4000 }); return; }
+    manualUpdate = true;
+    toast('Checking...');
+    try {
+      const r = await api.checkForUpdates();
+      if (r && r.state === 'unavailable') { manualUpdate = false; toast('Updates unavailable in portable/dev build', { ms: 4000 }); }
+      else if (r && r.state === 'error') { manualUpdate = false; toast("Couldn't check for updates", { ms: 5000 }); }
+    } catch (_) { manualUpdate = false; toast("Couldn't check for updates", { ms: 5000 }); }
+  });
 
   window.addEventListener('beforeunload', () => { pruneCache(new Set()); });
 
   updateChrome();
   updateZoomLabel();
+  restoreSession();
 })();

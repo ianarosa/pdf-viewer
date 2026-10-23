@@ -41,6 +41,7 @@ function pathsFromArgv(argv) {
 let win = null;
 let rendererReady = false;
 let pending = [];
+let lastRoots = [];   // root paths picked in the last open dialog (for session restore)
 
 function sendPaths(paths) {
   if (!paths.length) return;
@@ -63,7 +64,7 @@ function createWindow() {
   win.webContents.on('did-finish-load', () => {
     rendererReady = true;
     if (pending.length) {
-      win.webContents.send('open-paths', pending);
+      win.webContents.send('open-paths', pending, { launch: true });
       pending = [];
     }
   });
@@ -77,16 +78,22 @@ Menu.setApplicationMenu(null);
 function sendUpdate(payload) {
   if (win && !win.isDestroyed()) win.webContents.send('update-status', payload);
 }
+const canUpdate = () => app.isPackaged && !process.env.PORTABLE_EXECUTABLE_DIR;
+let updater = null;
+let manualCheck = false;   // true only while a user-initiated check runs: errors/no-update are reported then
 function setupAutoUpdate() {
-  if (!app.isPackaged || process.env.PORTABLE_EXECUTABLE_DIR) return;
+  if (!canUpdate()) return;
   try {
     const { autoUpdater } = require('electron-updater');
+    updater = autoUpdater;
     autoUpdater.autoDownload = true;
     autoUpdater.autoInstallOnAppQuit = true;
     autoUpdater.on('update-available', (i) => sendUpdate({ state: 'available', version: i && i.version }));
     autoUpdater.on('download-progress', (p) => sendUpdate({ state: 'progress', percent: p && p.percent }));
     autoUpdater.on('update-downloaded', (i) => sendUpdate({ state: 'downloaded', version: i && i.version }));
-    autoUpdater.on('error', () => { /* offline / no release yet: ignore silently */ });
+    autoUpdater.on('checking-for-update', () => { if (manualCheck) sendUpdate({ state: 'checking' }); });
+    autoUpdater.on('update-not-available', () => { if (manualCheck) sendUpdate({ state: 'not-available', version: app.getVersion() }); manualCheck = false; });
+    autoUpdater.on('error', () => { /* launch-time check stays silent; manual checks report */ if (manualCheck) sendUpdate({ state: 'error' }); manualCheck = false; });
     ipcMain.on('install-update', () => { try { autoUpdater.quitAndInstall(); } catch {} });
     const p = autoUpdater.checkForUpdates();
     if (p && p.catch) p.catch(() => {});
@@ -107,15 +114,25 @@ if (!app.requestSingleInstanceLock()) {
   ipcMain.handle('open-folder', async () => {
     const r = await dialog.showOpenDialog(win, { properties: ['openDirectory'] });
     if (r.canceled || !r.filePaths.length) return [];
+    lastRoots = r.filePaths.slice();
     return resolvePaths(r.filePaths);
   });
+  ipcMain.handle('last-roots', () => lastRoots);
   ipcMain.handle('open-files', async () => {
     const r = await dialog.showOpenDialog(win, {
       properties: ['openFile', 'multiSelections'],
       filters: [{ name: 'PDF', extensions: ['pdf'] }],
     });
     if (r.canceled || !r.filePaths.length) return [];
+    lastRoots = r.filePaths.slice();
     return resolvePaths(r.filePaths);
+  });
+  ipcMain.handle('get-version', () => app.getVersion());
+  ipcMain.handle('check-updates', async () => {
+    if (!canUpdate() || !updater) return { state: 'unavailable' };
+    manualCheck = true;
+    try { await updater.checkForUpdates(); return { state: 'started' }; }
+    catch { manualCheck = false; sendUpdate({ state: 'error' }); return { state: 'error' }; }
   });
   ipcMain.handle('resolve-paths', (_e, paths) => resolvePaths(paths));
   ipcMain.handle('read-file', async (_e, p) => {

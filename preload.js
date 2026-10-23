@@ -4,6 +4,9 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 contextBridge.exposeInMainWorld('api', {
   openFolder: () => ipcRenderer.invoke('open-folder'),
   openFiles: () => ipcRenderer.invoke('open-files'),
+  getVersion: () => ipcRenderer.invoke('get-version'),
+  checkForUpdates: () => ipcRenderer.invoke('check-updates'),
+  lastRoots: () => ipcRenderer.invoke('last-roots'),
   resolvePaths: (paths) => ipcRenderer.invoke('resolve-paths', paths),
   readFile: async (p) => {
     const buf = await ipcRenderer.invoke('read-file', p);
@@ -11,7 +14,7 @@ contextBridge.exposeInMainWorld('api', {
   },
   getPathForFile: (file) => webUtils.getPathForFile(file),
   onOpenPaths: (cb) => {
-    const handler = (_e, paths) => cb(paths);
+    const handler = (_e, paths, meta) => cb(paths, meta);
     ipcRenderer.on('open-paths', handler);
     return () => ipcRenderer.removeListener('open-paths', handler);
   },
